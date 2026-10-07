@@ -1,0 +1,9 @@
+node_modules/
+codedb.snapshot
+.pi/
+*.log
+.env*
+coverage/
+.DS_Store
+
+bun.lock*

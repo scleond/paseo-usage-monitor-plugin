@@ -1,0 +1,1046 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir, userInfo } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { describe, expect, test, vi } from "vitest";
+import { getUsagePreset } from "../shared/presets.shared";
+import {
+  createCredentialResolver,
+  createNodeCredentialAdapters,
+  expandPath,
+  type CredentialAdapters,
+  readMacKeychainItem,
+} from "./credentials.server";
+import { UsageCredentialMissingError, UsageInterpolationError } from "./errors.server";
+import type { UsageCredentials, UsageCredentialSource } from "../shared/limits.shared";
+vi.mock("node:child_process", () => ({ execFileSync: vi.fn() }));
+
+const HOME_DIR = "/home/tester";
+
+const CLAUDE_CREDENTIALS_PATH = `${HOME_DIR}/.claude/.credentials.json`;
+
+const CODEX_CREDENTIALS_PATH = `${HOME_DIR}/.codex/auth.json`;
+
+const NOW = new Date("2026-08-29T12:00:00.000Z");
+
+const NOW_MS = NOW.getTime();
+
+const HOUR_MS = 60 * 60 * 1000;
+
+const ACCESS_TOKEN = "sk-ant-oat01-abcdefgh";
+
+interface StubAdapters extends CredentialAdapters {
+  reads: string[];
+}
+
+interface StubAdaptersInput {
+  env?: NodeJS.ProcessEnv;
+  files?: Record<string, string | undefined>;
+  /** Present only on a host with a Keychain, as the node adapters are. */
+  keychain?: Record<string, string | undefined>;
+  sqlite?: Record<string, Record<string, string | null | undefined>>;
+  now?: Date;
+}
+
+function createStubAdapters(input: StubAdaptersInput): StubAdapters {
+  const files = input.files ?? {};
+  const sqlite = input.sqlite ?? {};
+  const reads: string[] = [];
+  const keychain = input.keychain;
+  return {
+    env: input.env ?? {},
+    homeDir: HOME_DIR,
+    reads,
+    now(): Date {
+      return input.now ?? NOW;
+    },
+    readTextFile(path: string): string | null {
+      reads.push(path);
+      return files[path] ?? null;
+    },
+    readKeychainItem:
+      keychain === undefined
+        ? undefined
+        : (service: string): string | null => {
+            reads.push(`keychain:${service}`);
+            return keychain[service] ?? null;
+          },
+    readSqliteQuery(path: string, query: string): string | null {
+      reads.push(`${path}?query=${query}`);
+      return sqlite[path]?.[query] ?? null;
+    },
+  };
+}
+
+function captureError<T extends Error>(expected: new (...args: never[]) => T, run: () => void): T {
+  try {
+    run();
+  } catch (error) {
+    if (error instanceof expected) return error;
+    throw error;
+  }
+  throw new Error(`the call under test did not throw ${expected.name}`);
+}
+
+const CLAUDE_FILE_SOURCE: UsageCredentialSource = {
+  kind: "jsonFile",
+  file: "~/.claude/.credentials.json",
+  path: "claudeAiOauth.accessToken",
+};
+
+const CHAINED_CREDENTIALS: UsageCredentials = {
+  CLAUDE_TOKEN: [CLAUDE_FILE_SOURCE, { kind: "env", variable: "ANTHROPIC_API_KEY" }],
+};
+
+describe("expandPath", () => {
+  test("expands a bare tilde to the home directory", () => {
+    expect(expandPath("~", createStubAdapters({}))).toBe(HOME_DIR);
+  });
+
+  test("expands a leading tilde segment", () => {
+    expect(expandPath("~/.codex/auth.json", createStubAdapters({}))).toBe(
+      `${HOME_DIR}/.codex/auth.json`,
+    );
+  });
+
+  test("leaves a tilde inside the path alone", () => {
+    expect(expandPath("/srv/~backup/auth.json", createStubAdapters({}))).toBe(
+      "/srv/~backup/auth.json",
+    );
+  });
+
+  test("expands an environment variable", () => {
+    const adapters = createStubAdapters({ env: { XDG_CONFIG_HOME: "/cfg" } });
+    expect(expandPath("${XDG_CONFIG_HOME}/codex/auth.json", adapters)).toBe("/cfg/codex/auth.json");
+  });
+
+  test("names the unset variable instead of expanding it to nothing", () => {
+    const error = captureError(UsageInterpolationError, () => {
+      expandPath("${XDG_CONFIG_HOME}/codex/auth.json", createStubAdapters({}));
+    });
+    expect(error.variable).toBe("XDG_CONFIG_HOME");
+    expect(error.message).toContain("XDG_CONFIG_HOME");
+  });
+
+  test("treats an empty environment variable as unset", () => {
+    const adapters = createStubAdapters({ env: { CODEX_HOME: "" } });
+    const error = captureError(UsageInterpolationError, () => {
+      expandPath("${CODEX_HOME}/auth.json", adapters);
+    });
+    expect(error.variable).toBe("CODEX_HOME");
+  });
+});
+
+describe("createCredentialResolver", () => {
+  test("resolves an environment credential", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "kimi-value" } });
+    const credentials: UsageCredentials = {
+      KIMI_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("KIMI_TOKEN")).toBe(
+      "kimi-value",
+    );
+  });
+
+  test("reads a nested json path out of a credential file", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({
+          claudeAiOauth: { accessToken: "oauth-value", expiresAt: 1_772_366_400_000 },
+        }),
+      },
+    });
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    expect(resolver.resolve("CLAUDE_TOKEN")).toBe("oauth-value");
+    expect(adapters.reads).toEqual([CLAUDE_CREDENTIALS_PATH]);
+  });
+
+  test("falls back to the next source when the credential file is missing", () => {
+    const adapters = createStubAdapters({ env: { ANTHROPIC_API_KEY: "env-value" } });
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    expect(resolver.resolve("CLAUDE_TOKEN")).toBe("env-value");
+    expect(adapters.reads).toEqual([CLAUDE_CREDENTIALS_PATH]);
+  });
+
+  test("skips a credential file whose json path is absent", () => {
+    const adapters = createStubAdapters({
+      env: { ANTHROPIC_API_KEY: "env-value" },
+      files: { [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({ claudeAiOauth: {} }) },
+    });
+    expect(createCredentialResolver(CHAINED_CREDENTIALS, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "env-value",
+    );
+  });
+
+  test("skips a credential file that does not contain json", () => {
+    const adapters = createStubAdapters({
+      env: { ANTHROPIC_API_KEY: "env-value" },
+      files: { [CLAUDE_CREDENTIALS_PATH]: "not json at all" },
+    });
+    expect(createCredentialResolver(CHAINED_CREDENTIALS, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "env-value",
+    );
+  });
+
+  test("skips a source whose file path references an unset variable", () => {
+    const adapters = createStubAdapters({ env: { ANTHROPIC_API_KEY: "env-value" } });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [
+        { kind: "jsonFile", file: "${CODEX_HOME}/auth.json", path: "tokens.access_token" },
+        { kind: "env", variable: "ANTHROPIC_API_KEY" },
+      ],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "env-value",
+    );
+    expect(adapters.reads).toEqual([]);
+  });
+
+  test("treats a blank environment variable as a failed source", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "   ", FALLBACK: "fallback-value" } });
+    const credentials: UsageCredentials = {
+      KIMI_TOKEN: [
+        { kind: "env", variable: "KIMI_TOKEN" },
+        { kind: "env", variable: "FALLBACK" },
+      ],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("KIMI_TOKEN")).toBe(
+      "fallback-value",
+    );
+  });
+
+  test("trims the trailing newline a shell export leaves on an environment token", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "kimi-value\n" } });
+    const credentials: UsageCredentials = {
+      KIMI_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("KIMI_TOKEN")).toBe(
+      "kimi-value",
+    );
+  });
+
+  test("trims whitespace surrounding a token read out of a credential file", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({
+          claudeAiOauth: { accessToken: " oauth-value\n" },
+        }),
+      },
+    });
+    expect(createCredentialResolver(CHAINED_CREDENTIALS, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "oauth-value",
+    );
+  });
+
+  test("reads a credential once and reuses the resolved value", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({ claudeAiOauth: { accessToken: "oauth" } }),
+      },
+    });
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    expect(resolver.resolve("CLAUDE_TOKEN")).toBe("oauth");
+    expect(resolver.resolve("CLAUDE_TOKEN")).toBe("oauth");
+    expect(adapters.reads).toEqual([CLAUDE_CREDENTIALS_PATH]);
+  });
+
+  test("lists every source tried and no resolved value when the chain fails", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({
+          claudeAiOauth: { refreshToken: "sk-secret-refresh" },
+        }),
+      },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }, CLAUDE_FILE_SOURCE],
+    };
+    const resolver = createCredentialResolver(credentials, adapters);
+    const error = captureError(UsageCredentialMissingError, () => {
+      resolver.resolve("CLAUDE_TOKEN");
+    });
+    expect(error.credentialName).toBe("CLAUDE_TOKEN");
+    expect(error.tried).toEqual([
+      "env KIMI_TOKEN",
+      "file ~/.claude/.credentials.json#claudeAiOauth.accessToken",
+    ]);
+    expect(error.message).toContain("env KIMI_TOKEN");
+    expect(error.message).toContain("file ~/.claude/.credentials.json#claudeAiOauth.accessToken");
+    expect(error.message).not.toContain("sk-secret-refresh");
+  });
+
+  test("reports an undeclared credential instead of reading the environment", () => {
+    const adapters = createStubAdapters({ env: { CLAUDE_TOKEN: "env-value" } });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({}, adapters).resolve("CLAUDE_TOKEN");
+    });
+    expect(error.tried).toEqual([]);
+    expect(error.message).toContain("CLAUDE_TOKEN");
+  });
+});
+
+describe("a place that exists and holds no token", () => {
+  test("reads as signed out rather than as a missing file", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [`${HOME_DIR}/.claude/.credentials.json`]: JSON.stringify({
+          claudeAiOauth: { accessToken: "   " },
+        }),
+      },
+    });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ TOKEN: [CLAUDE_FILE_SOURCE] }, adapters).resolve("TOKEN");
+    });
+
+    expect(error.message).toContain("(no token stored)");
+  });
+
+  test("says nothing extra when the file is genuinely absent", () => {
+    const adapters = createStubAdapters({});
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ TOKEN: [CLAUDE_FILE_SOURCE] }, adapters).resolve("TOKEN");
+    });
+
+    expect(error.message).not.toContain("no token stored");
+  });
+
+  test("an exported but blank variable reads the same way", () => {
+    const adapters = createStubAdapters({ env: { ANTHROPIC_API_KEY: "" } });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver(
+        { TOKEN: [{ kind: "env", variable: "ANTHROPIC_API_KEY" }] },
+        adapters,
+      ).resolve("TOKEN");
+    });
+
+    expect(error.message).toContain("env ANTHROPIC_API_KEY (no token stored)");
+  });
+});
+
+describe("a source whose variable is not set", () => {
+  const TEMPLATED_SOURCE: UsageCredentialSource = {
+    kind: "jsonFile",
+    file: "${CLAUDE_CONFIG_DIR}/.credentials.json",
+    path: "claudeAiOauth.accessToken",
+  };
+
+  test("names the variable rather than a path that was never built", () => {
+    const adapters = createStubAdapters({});
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ TOKEN: [TEMPLATED_SOURCE] }, adapters).resolve("TOKEN");
+    });
+
+    // "file X does not resolve" would send the user looking for a file. The
+    // variable is unset, so that path never existed to be missing.
+    expect(error.message).toContain("(CLAUDE_CONFIG_DIR is not set)");
+  });
+
+  test("is distinguished from a file that is genuinely absent", () => {
+    const adapters = createStubAdapters({ env: { CLAUDE_CONFIG_DIR: "/cfg" } });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ TOKEN: [TEMPLATED_SOURCE] }, adapters).resolve("TOKEN");
+    });
+
+    expect(error.message).not.toContain("is not set");
+  });
+
+  test("keeps walking the chain to a source whose path is real", () => {
+    const adapters = createStubAdapters({
+      files: { [`${HOME_DIR}/.claude/.credentials.json`]: claudeCredentialsFile(undefined) },
+    });
+
+    const resolved = createCredentialResolver(
+      { TOKEN: [TEMPLATED_SOURCE, CLAUDE_FILE_SOURCE] },
+      adapters,
+    ).resolve("TOKEN");
+
+    expect(resolved).toBe(ACCESS_TOKEN);
+  });
+});
+
+const CLAUDE_EXPIRING_SOURCE: UsageCredentialSource = {
+  kind: "jsonFile",
+  file: "~/.claude/.credentials.json",
+  path: "claudeAiOauth.accessToken",
+  expiresAtPath: "claudeAiOauth.expiresAt",
+};
+
+const CLAUDE_EXPIRING_DESCRIPTION = "file ~/.claude/.credentials.json#claudeAiOauth.accessToken";
+
+function claudeCredentialsFile(expiresAt: unknown): string {
+  return JSON.stringify({ claudeAiOauth: { accessToken: ACCESS_TOKEN, expiresAt } });
+}
+
+function describeExpiredClaudeSource(expiresAt: unknown): string {
+  const adapters = createStubAdapters({
+    files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(expiresAt) },
+  });
+  const error = captureError(UsageCredentialMissingError, () => {
+    createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE] }, adapters).resolve(
+      "CLAUDE_TOKEN",
+    );
+  });
+  expect(error.message).not.toContain(ACCESS_TOKEN);
+  return error.tried[0] ?? "";
+}
+
+describe("createCredentialResolver credential expiry", () => {
+  test("resolves a credential whose expiry is still ahead", () => {
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS + HOUR_MS) },
+    });
+    expect(
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toBe(ACCESS_TOKEN);
+  });
+
+  test("skips an expired source so the next one in the chain wins", () => {
+    const adapters = createStubAdapters({
+      env: { ANTHROPIC_API_KEY: "env-value" },
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS - 34 * HOUR_MS) },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE, { kind: "env", variable: "ANTHROPIC_API_KEY" }],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "env-value",
+    );
+    expect(adapters.reads).toEqual([CLAUDE_CREDENTIALS_PATH]);
+  });
+
+  test("describes every source as expired when the whole chain has gone stale", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS - 34 * HOUR_MS),
+        [CODEX_CREDENTIALS_PATH]: JSON.stringify({
+          tokens: { access_token: "codex-token-value", expires_at: NOW_MS - 80 * HOUR_MS },
+        }),
+      },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [
+        CLAUDE_EXPIRING_SOURCE,
+        {
+          kind: "jsonFile",
+          file: "~/.codex/auth.json",
+          path: "tokens.access_token",
+          expiresAtPath: "tokens.expires_at",
+        },
+      ],
+    };
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN");
+    });
+    expect(error.tried).toEqual([
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 1d ago)`,
+      "file ~/.codex/auth.json#tokens.access_token (expired 3d ago)",
+    ]);
+    expect(error.message).toContain("(expired 1d ago)");
+    expect(error.message).not.toContain(ACCESS_TOKEN);
+    expect(error.message).not.toContain("codex-token-value");
+  });
+
+  test("reads an epoch-milliseconds expiry", () => {
+    expect(describeExpiredClaudeSource(NOW_MS - 5 * HOUR_MS)).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 5h ago)`,
+    );
+  });
+
+  test("reads an epoch-seconds expiry", () => {
+    expect(describeExpiredClaudeSource((NOW_MS - 5 * HOUR_MS) / 1000)).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 5h ago)`,
+    );
+  });
+
+  test("reads an iso string expiry", () => {
+    expect(describeExpiredClaudeSource(new Date(NOW_MS - 5 * HOUR_MS).toISOString())).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 5h ago)`,
+    );
+  });
+
+  test("reports an age of a day or more in whole days", () => {
+    expect(describeExpiredClaudeSource(NOW_MS - 34 * HOUR_MS)).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 1d ago)`,
+    );
+  });
+
+  test("counts an expiry exactly equal to now as expired", () => {
+    expect(describeExpiredClaudeSource(NOW_MS)).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 0m ago)`,
+    );
+  });
+
+  test("reports an age under an hour in minutes", () => {
+    expect(describeExpiredClaudeSource(NOW_MS - 7 * 60 * 1000)).toBe(
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 7m ago)`,
+    );
+  });
+
+  test("treats an absent expiry field as no expiry", () => {
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(undefined) },
+    });
+    expect(
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toBe(ACCESS_TOKEN);
+  });
+
+  test("treats an unparseable expiry value as no expiry", () => {
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile("whenever") },
+    });
+    expect(
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toBe(ACCESS_TOKEN);
+  });
+
+  test("treats an expiry path that resolves to nothing as no expiry", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({
+          claudeAiOauth: { accessToken: ACCESS_TOKEN, expiresAt: null },
+        }),
+      },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [{ ...CLAUDE_EXPIRING_SOURCE, expiresAtPath: "claudeAiOauth.notARealField" }],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      ACCESS_TOKEN,
+    );
+  });
+
+  test("leaves an env source undecorated when a sibling file source expired", () => {
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS - 34 * HOUR_MS) },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE, { kind: "env", variable: "ANTHROPIC_API_KEY" }],
+    };
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN");
+    });
+    expect(error.tried).toEqual([
+      `${CLAUDE_EXPIRING_DESCRIPTION} (expired 1d ago)`,
+      "env ANTHROPIC_API_KEY",
+    ]);
+  });
+
+  test("uses the injected clock rather than the wall clock", () => {
+    const adapters = createStubAdapters({
+      now: new Date(NOW_MS - 48 * HOUR_MS),
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS - 34 * HOUR_MS) },
+    });
+    expect(
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toBe(ACCESS_TOKEN);
+  });
+});
+
+describe("UsageCredentialResolver.redact", () => {
+  test("replaces a resolved token inside a longer message", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "sk-live-abcdefgh" } });
+    const resolver = createCredentialResolver(
+      { KIMI_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }] },
+      adapters,
+    );
+    resolver.resolve("KIMI_TOKEN");
+    expect(resolver.redact('401 from vendor: {"rejected":"sk-live-abcdefgh"}')).toBe(
+      '401 from vendor: {"rejected":"<redacted>"}',
+    );
+  });
+
+  test("leaves text untouched before anything is resolved", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "sk-live-abcdefgh" } });
+    const resolver = createCredentialResolver(
+      { KIMI_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }] },
+      adapters,
+    );
+    expect(resolver.redact("Request to api.moonshot.ai failed: sk-live-abcdefgh")).toBe(
+      "Request to api.moonshot.ai failed: sk-live-abcdefgh",
+    );
+  });
+
+  test("replaces every occurrence of the same resolved token", () => {
+    const adapters = createStubAdapters({ env: { KIMI_TOKEN: "sk-live-abcdefgh" } });
+    const resolver = createCredentialResolver(
+      { KIMI_TOKEN: [{ kind: "env", variable: "KIMI_TOKEN" }] },
+      adapters,
+    );
+    resolver.resolve("KIMI_TOKEN");
+    expect(resolver.redact("sk-live-abcdefgh echoed as sk-live-abcdefgh")).toBe(
+      "<redacted> echoed as <redacted>",
+    );
+  });
+
+  test("replaces both values in full when one resolved value contains another", () => {
+    const adapters = createStubAdapters({
+      env: { LONG_TOKEN: "supersecrettoken", SHORT_TOKEN: "supersecret" },
+    });
+    const resolver = createCredentialResolver(
+      {
+        LONG_TOKEN: [{ kind: "env", variable: "LONG_TOKEN" }],
+        SHORT_TOKEN: [{ kind: "env", variable: "SHORT_TOKEN" }],
+      },
+      adapters,
+    );
+    resolver.resolve("LONG_TOKEN");
+    resolver.resolve("SHORT_TOKEN");
+    const scrubbed = resolver.redact("sent supersecrettoken, retried with supersecret");
+    expect(scrubbed).toBe("sent <redacted>, retried with <redacted>");
+    expect(scrubbed).not.toContain("supersecret");
+  });
+
+  test("never replaces the credential's name", () => {
+    const adapters = createStubAdapters({ env: { CLAUDE_TOKEN: "sk-live-abcdefgh" } });
+    const resolver = createCredentialResolver(
+      { CLAUDE_TOKEN: [{ kind: "env", variable: "CLAUDE_TOKEN" }] },
+      adapters,
+    );
+    resolver.resolve("CLAUDE_TOKEN");
+    expect(resolver.redact("CLAUDE_TOKEN was rejected")).toBe("CLAUDE_TOKEN was rejected");
+  });
+
+  test("leaves a value shorter than the redaction floor alone", () => {
+    const adapters = createStubAdapters({ env: { TINY_TOKEN: "abc1234" } });
+    const resolver = createCredentialResolver(
+      { TINY_TOKEN: [{ kind: "env", variable: "TINY_TOKEN" }] },
+      adapters,
+    );
+    expect(resolver.resolve("TINY_TOKEN")).toBe("abc1234");
+    expect(resolver.redact("vendor said abc1234 is not a token")).toBe(
+      "vendor said abc1234 is not a token",
+    );
+  });
+
+  test("redacts a token resolved out of a credential file", () => {
+    const adapters = createStubAdapters({
+      files: {
+        [CLAUDE_CREDENTIALS_PATH]: JSON.stringify({
+          claudeAiOauth: { accessToken: "sk-ant-oat01-abcdefgh" },
+        }),
+      },
+    });
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    resolver.resolve("CLAUDE_TOKEN");
+    expect(resolver.redact("invalid header value: sk-ant-oat01-abcdefgh")).toBe(
+      "invalid header value: <redacted>",
+    );
+  });
+});
+
+describe("a credential kept in the macOS Keychain", () => {
+  const KEYCHAIN_SERVICE = "Claude Code-credentials";
+
+  const CLAUDE_KEYCHAIN_SOURCE: UsageCredentialSource = {
+    kind: "keychain",
+    service: KEYCHAIN_SERVICE,
+    path: "claudeAiOauth.accessToken",
+    expiresAtPath: "claudeAiOauth.expiresAt",
+  };
+
+  const CLAUDE_KEYCHAIN_DESCRIPTION = `keychain "${KEYCHAIN_SERVICE}"#claudeAiOauth.accessToken`;
+
+  test("passes the macOS username as the Keychain account", () => {
+    const command = vi.mocked(execFileSync);
+    command.mockReturnValueOnce(ACCESS_TOKEN as never);
+
+    expect(readMacKeychainItem(KEYCHAIN_SERVICE)).toBe(ACCESS_TOKEN);
+    expect(command).toHaveBeenCalledWith(
+      "security",
+      ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", userInfo().username, "-w"],
+      expect.objectContaining({ encoding: "utf8", timeout: 5_000 }),
+    );
+  });
+
+  test.skipIf(process.platform === "darwin")(
+    "does not expose a Keychain adapter on non-macOS hosts",
+    () => {
+      expect(createNodeCredentialAdapters().readKeychainItem).toBeUndefined();
+    },
+  );
+
+  test("falls back to the credential file when the account-matched Keychain item is absent", () => {
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS + HOUR_MS) },
+      keychain: {},
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [
+        CLAUDE_KEYCHAIN_SOURCE,
+        {
+          kind: "jsonFile",
+          file: "~/.claude/.credentials.json",
+          path: "claudeAiOauth.accessToken",
+          expiresAtPath: "claudeAiOauth.expiresAt",
+        },
+      ],
+    };
+
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      ACCESS_TOKEN,
+    );
+    expect(adapters.reads).toEqual([`keychain:${KEYCHAIN_SERVICE}`, CLAUDE_CREDENTIALS_PATH]);
+  });
+  test("reads the token out of the item's json, the same way as a file", () => {
+    const adapters = createStubAdapters({
+      keychain: { [KEYCHAIN_SERVICE]: claudeCredentialsFile(NOW_MS + HOUR_MS) },
+    });
+    expect(
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toBe(ACCESS_TOKEN);
+    expect(adapters.reads).toEqual([`keychain:${KEYCHAIN_SERVICE}`]);
+  });
+
+  test("wins over a stale credential file that sits earlier in the chain", () => {
+    // Claude Code on macOS stops writing the file once it has a Keychain, so
+    // the file lingers with a token that expired weeks ago.
+    const adapters = createStubAdapters({
+      files: { [CLAUDE_CREDENTIALS_PATH]: claudeCredentialsFile(NOW_MS - 14 * 24 * HOUR_MS) },
+      keychain: { [KEYCHAIN_SERVICE]: claudeCredentialsFile(NOW_MS + HOUR_MS) },
+    });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [CLAUDE_EXPIRING_SOURCE, CLAUDE_KEYCHAIN_SOURCE],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      ACCESS_TOKEN,
+    );
+  });
+
+  test("is skipped on a host without a Keychain and says so", () => {
+    const adapters = createStubAdapters({ env: { ANTHROPIC_API_KEY: "env-value" } });
+    const credentials: UsageCredentials = {
+      CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE, { kind: "env", variable: "ANTHROPIC_API_KEY" }],
+    };
+    expect(createCredentialResolver(credentials, adapters).resolve("CLAUDE_TOKEN")).toBe(
+      "env-value",
+    );
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      );
+    });
+    expect(error.tried).toEqual([`${CLAUDE_KEYCHAIN_DESCRIPTION} (no Keychain on this host)`]);
+  });
+
+  test("an item that is missing reads as unavailable, not as signed out", () => {
+    const adapters = createStubAdapters({ keychain: {} });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      );
+    });
+    expect(error.tried).toEqual([CLAUDE_KEYCHAIN_DESCRIPTION]);
+  });
+
+  test("an expired item names itself with its age and never its value", () => {
+    const adapters = createStubAdapters({
+      keychain: { [KEYCHAIN_SERVICE]: claudeCredentialsFile(NOW_MS - 5 * HOUR_MS) },
+    });
+    const error = captureError(UsageCredentialMissingError, () => {
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      );
+    });
+    expect(error.tried).toEqual([`${CLAUDE_KEYCHAIN_DESCRIPTION} (expired 5h ago)`]);
+    expect(error.message).not.toContain(ACCESS_TOKEN);
+  });
+
+  test("an item that is not json is skipped", () => {
+    const adapters = createStubAdapters({ keychain: { [KEYCHAIN_SERVICE]: "not json" } });
+    expect(() =>
+      createCredentialResolver({ CLAUDE_TOKEN: [CLAUDE_KEYCHAIN_SOURCE] }, adapters).resolve(
+        "CLAUDE_TOKEN",
+      ),
+    ).toThrow(UsageCredentialMissingError);
+  });
+});
+describe("sqlite credentials", () => {
+  const DB_PATH = `${HOME_DIR}/.omp/agent/agent.db`;
+  const QUERY = "SELECT data FROM auth_credentials WHERE provider = 'anthropic'";
+
+  test("resolves a token directly from a scalar query", () => {
+    const adapters = createStubAdapters({
+      sqlite: {
+        [DB_PATH]: {
+          "SELECT token FROM auth": "sk-secret-from-db",
+        },
+      },
+    });
+    const resolver = createCredentialResolver(
+      {
+        DB_TOKEN: [
+          {
+            kind: "sqlite",
+            file: "~/.omp/agent/agent.db",
+            query: "SELECT token FROM auth",
+          },
+        ],
+      },
+      adapters,
+    );
+    expect(resolver.resolve("DB_TOKEN")).toBe("sk-secret-from-db");
+  });
+
+  test("resolves a token from a JSON string using path", () => {
+    const adapters = createStubAdapters({
+      sqlite: {
+        [DB_PATH]: {
+          [QUERY]: JSON.stringify({ access: "sk-access-from-json" }),
+        },
+      },
+    });
+    const resolver = createCredentialResolver(
+      {
+        ANTHROPIC_TOKEN: [
+          {
+            kind: "sqlite",
+            file: "~/.omp/agent/agent.db",
+            query: QUERY,
+            path: "access",
+          },
+        ],
+      },
+      adapters,
+    );
+    expect(resolver.resolve("ANTHROPIC_TOKEN")).toBe("sk-access-from-json");
+  });
+
+  test("skips an expired sqlite token and falls through to next source", () => {
+    const adapters = createStubAdapters({
+      sqlite: {
+        [DB_PATH]: {
+          [QUERY]: JSON.stringify({
+            access: "stale-token",
+            expires: new Date(NOW_MS - HOUR_MS).toISOString(),
+          }),
+        },
+      },
+      env: { FALLBACK_TOKEN: "valid-fallback" },
+    });
+    const resolver = createCredentialResolver(
+      {
+        TOKEN: [
+          {
+            kind: "sqlite",
+            file: "~/.omp/agent/agent.db",
+            query: QUERY,
+            path: "access",
+            expiresAtPath: "expires",
+          },
+          {
+            kind: "env",
+            variable: "FALLBACK_TOKEN",
+          },
+        ],
+      },
+      adapters,
+    );
+    expect(resolver.resolve("TOKEN")).toBe("valid-fallback");
+  });
+
+  test("redacts a token resolved out of sqlite", () => {
+    const adapters = createStubAdapters({
+      sqlite: {
+        [DB_PATH]: {
+          "SELECT token FROM auth": "sk-secret-from-db",
+        },
+      },
+    });
+    const resolver = createCredentialResolver(
+      {
+        DB_TOKEN: [
+          {
+            kind: "sqlite",
+            file: "~/.omp/agent/agent.db",
+            query: "SELECT token FROM auth",
+          },
+        ],
+      },
+      adapters,
+    );
+    resolver.resolve("DB_TOKEN");
+    expect(resolver.redact("Bearer sk-secret-from-db")).toBe("Bearer <redacted>");
+  });
+});
+
+describe("resolvedSource", () => {
+  test("names the source that produced the value, not the first in the chain", () => {
+    const adapters = createStubAdapters({ env: { ANTHROPIC_API_KEY: "env-value" } });
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    expect(resolver.resolvedSource("CLAUDE_TOKEN")).toBeUndefined();
+    expect(resolver.resolve("CLAUDE_TOKEN")).toBe("env-value");
+    // The file source came first but resolved nothing, so the remedy must not
+    // name it: the environment variable is what actually held the token.
+    expect(resolver.resolvedSource("CLAUDE_TOKEN")).toEqual({
+      kind: "env",
+      variable: "ANTHROPIC_API_KEY",
+    });
+  });
+
+  test("stays undefined for a name whose whole chain fails", () => {
+    const adapters = createStubAdapters({});
+    const resolver = createCredentialResolver(CHAINED_CREDENTIALS, adapters);
+    expect(() => resolver.resolve("CLAUDE_TOKEN")).toThrow(UsageCredentialMissingError);
+    expect(resolver.resolvedSource("CLAUDE_TOKEN")).toBeUndefined();
+  });
+});
+
+describe("the real sqlite adapter", () => {
+  test("reads a selected value but never executes a write statement", () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-credentials-sqlite-"));
+    try {
+      const dbPath = join(dir, "auth.db");
+      const dumpPath = join(dir, "dump.db");
+      const writer = new DatabaseSync(dbPath);
+      writer.exec("CREATE TABLE auth (token TEXT)");
+      writer.exec("INSERT INTO auth (token) VALUES ('sk-sqlite-value')");
+      writer.close();
+
+      const readSqliteQuery = createNodeCredentialAdapters().readSqliteQuery;
+      if (typeof readSqliteQuery !== "function") {
+        throw new Error("the node adapter must offer readSqliteQuery");
+      }
+      expect(readSqliteQuery(dbPath, "SELECT token FROM auth")).toBe("sk-sqlite-value");
+      expect(readSqliteQuery(dbPath, `VACUUM INTO '${dumpPath}'`)).toBeNull();
+      expect(existsSync(dumpPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("prefers the explicit OMP agent directory over the configured home directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-credentials-path-precedence-"));
+    try {
+      const explicitDir = join(dir, "explicit-agent");
+      const homeDir = join(dir, "home");
+      const configuredDbPath = join(homeDir, "configured", "agent", "agent.db");
+      const explicitDbPath = join(explicitDir, "agent.db");
+      mkdirSync(explicitDir, { recursive: true });
+      mkdirSync(join(homeDir, "configured", "agent"), { recursive: true });
+
+      const createVault = (dbPath: string, key: string) => {
+        const writer = new DatabaseSync(dbPath);
+        writer.exec(
+          "CREATE TABLE auth_credentials (provider TEXT, credential_type TEXT, disabled_cause TEXT, updated_at TEXT, data TEXT)",
+        );
+        writer
+          .prepare(
+            "INSERT INTO auth_credentials VALUES ('deepseek', 'api_key', NULL, '2026-09-20T00:00:00Z', ?)",
+          )
+          .run(JSON.stringify({ key }));
+        writer.close();
+      };
+      createVault(explicitDbPath, "explicit-agent-key");
+      createVault(configuredDbPath, "configured-home-key");
+
+      const preset = getUsagePreset("deepseek");
+      if (preset === null) throw new Error("DeepSeek preset must exist");
+      const adapters = createNodeCredentialAdapters();
+      const readSqliteQuery = vi.spyOn(adapters, "readSqliteQuery");
+      const resolver = createCredentialResolver(preset.credentials, {
+        ...adapters,
+        env: {
+          DEEPSEEK_API_KEY: "",
+          PI_CODING_AGENT_DIR: explicitDir,
+          PI_CONFIG_DIR: "configured",
+        },
+        homeDir,
+      });
+
+      expect(resolver.resolve("apiKey")).toBe("explicit-agent-key");
+      expect(readSqliteQuery).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("prefers the environment credential over an OMP SQLite file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-credentials-precedence-"));
+    try {
+      const dbPath = join(dir, "agent.db");
+      const writer = new DatabaseSync(dbPath);
+      writer.exec("CREATE TABLE auth_credentials (data TEXT)");
+      writer.exec(`INSERT INTO auth_credentials VALUES ('{"key":"vault-key"}')`);
+      writer.close();
+
+      const adapters = createNodeCredentialAdapters();
+      const readSqliteQuery = vi.spyOn(adapters, "readSqliteQuery");
+      const resolver = createCredentialResolver(
+        {
+          apiKey: [
+            { kind: "env", variable: "DEEPSEEK_API_KEY" },
+            {
+              kind: "sqlite",
+              file: dbPath,
+              query: "SELECT data FROM auth_credentials",
+              path: "key",
+              refreshedBy: "omp",
+            },
+          ],
+        },
+        { ...adapters, env: { DEEPSEEK_API_KEY: "explicit-key" } },
+      );
+
+      expect(resolver.resolve("apiKey")).toBe("explicit-key");
+      expect(readSqliteQuery).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("selects the newest enabled API-key row from the OMP SQLite database", () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-credentials-current-row-"));
+    try {
+      const dbPath = join(dir, "agent.db");
+      const writer = new DatabaseSync(dbPath);
+      writer.exec(
+        "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT, disabled_cause TEXT, updated_at TEXT, data TEXT)",
+      );
+      const insert = writer.prepare(
+        "INSERT INTO auth_credentials (provider, credential_type, disabled_cause, updated_at, data) VALUES (?, ?, ?, ?, ?)",
+      );
+      insert.run("deepseek", "api_key", null, "2026-01-01T00:00:00Z", '{"key":"old-key"}');
+      insert.run(
+        "deepseek",
+        "api_key",
+        "revoked",
+        "2026-09-20T00:00:00Z",
+        '{"key":"disabled-key"}',
+      );
+      insert.run("deepseek", "oauth", null, "2026-09-19T00:00:00Z", '{"access":"oauth-token"}');
+      insert.run("deepseek", "api_key", null, "2026-09-18T00:00:00Z", '{"key":"newest-key"}');
+      writer.close();
+
+      const resolver = createCredentialResolver(
+        {
+          apiKey: [
+            {
+              kind: "sqlite",
+              file: dbPath,
+              query:
+                "SELECT data FROM auth_credentials WHERE provider = 'deepseek' AND credential_type = 'api_key' AND disabled_cause IS NULL ORDER BY updated_at DESC LIMIT 1",
+              path: "key",
+              refreshedBy: "omp",
+            },
+          ],
+        },
+        createNodeCredentialAdapters(),
+      );
+
+      expect(resolver.resolve("apiKey")).toBe("newest-key");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Paseo hosts plugins on Electron's Node; node:sqlite needs Node >= 22.13 unflagged.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Same command Paseo runs on plugin install (paseo-plugin.json "build").
+      - run: npm ci --include=dev
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+  # Installs the plugin into a real, isolated Paseo daemon the way `paseo plugin add`
+  # does for users, from both a bare checkout (git install) and the packed npm
+  # tarball (npm install). Catches failures only the daemon's plugin compiler sees,
+  # such as a specifier the runtime rejects (#8) or a file missing from `files`.
+  plugin-install:
+    runs-on: ubuntu-latest
+    env:
+      PASEO_CLI_VERSION: 0.9.2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm install -g "@getpaseo/cli@${PASEO_CLI_VERSION}"
+
+      # Mirror Paseo's npm source install: `npm install --omit=dev` of the published
+      # artifact into a wrapper directory. Nothing is installed into the checkout,
+      # which therefore stands in for a git install.
+      - name: Pack and install the npm artifact
+        run: |
+          wrapper="$RUNNER_TEMP/npm-install"
+          mkdir -p "$wrapper"
+          npm pack --pack-destination "$RUNNER_TEMP"
+          cd "$wrapper"
+          npm init -y >/dev/null
+          npm install --omit=dev --ignore-scripts --legacy-peer-deps --no-audit --no-fund "$RUNNER_TEMP"/*.tgz
+          echo "NPM_PLUGIN_DIR=$wrapper/node_modules/paseo-usage-monitor" >> "$GITHUB_ENV"
+
+      - name: Start an isolated daemon with plugins enabled
+        run: |
+          home="$RUNNER_TEMP/paseo-home"
+          echo "PASEO_HOME_DIR=$home" >> "$GITHUB_ENV"
+          paseo daemon config set daemon.listen 127.0.0.1:6799 --home "$home"
+          paseo daemon config set pluginsEnabled true --home "$home"
+          paseo daemon start --home "$home" --timeout 180
+
+      - name: Install from the checkout and from the npm artifact
+        run: |
+          paseo plugin add "$GITHUB_WORKSPACE" --id usage-monitor-git --home "$PASEO_HOME_DIR" --json
+          paseo plugin add "$NPM_PLUGIN_DIR" --id usage-monitor-npm --home "$PASEO_HOME_DIR" --json
+
+      - name: Wait for both plugins to be running
+        run: |
+          for id in usage-monitor-git usage-monitor-npm; do
+            ok=false
+            for _ in $(seq 1 60); do
+              status=$(paseo plugin ls "$id" --home "$PASEO_HOME_DIR" --json | jq -r '.[0].status')
+              echo "$id: $status"
+              case "$status" in
+                running) ok=true; break ;;
+                failed) break ;;
+              esac
+              sleep 5
+            done
+            if [ "$ok" != true ]; then
+              paseo plugin ls "$id" --home "$PASEO_HOME_DIR" --json
+              exit 1
+            fi
+          done
+
+      - name: Plugin and daemon logs
+        if: always()
+        run: |
+          for id in usage-monitor-git usage-monitor-npm; do
+            echo "== $id"
+            paseo plugin logs "$id" --home "$PASEO_HOME_DIR" || true
+          done
+          tail -n 100 "$PASEO_HOME_DIR/daemon.log" || true

@@ -1,0 +1,222 @@
+import type { PluginTheme } from "@getpaseo/plugin";
+import { useMemo } from "react";
+import { View, type ViewStyle } from "react-native";
+
+export function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, value));
+}
+
+/** Thresholds always follow consumption, even when the geometry shows what remains. */
+export function usageTone(percentUsed: number, theme: PluginTheme): string {
+  if (percentUsed > 90) {
+    return theme.colors.statusDanger;
+  }
+  if (percentUsed >= 70) {
+    return theme.colors.statusWarning;
+  }
+  return theme.colors.accent;
+}
+
+export interface UsageMeterProps {
+  /** Raw percent consumed. It chooses the threshold tone and is never clamped for labels. */
+  percentUsed: number;
+  /** The value the geometry depicts. Omit when it is the same as consumption. */
+  percentFilled?: number;
+  /** 0-100 where even consumption would sit now, expressed in the same direction as the fill. */
+  pacePercent: number | null;
+  style?: "bar" | "ring";
+  /**
+   * "card" keeps the 42/50px rings and 4/6px bars. "rail" shrinks the ring to
+   * 14px and lets a 4px bar fill whatever width its parent gives it.
+   */
+  scale?: "card" | "rail";
+  /**
+   * The empty part of the gauge. Defaults to `surface2`, which disappears on a
+   * surface of the same colour, so a caller that draws on one passes something
+   * darker to keep the groove visible.
+   */
+  trackColor?: string;
+  theme: PluginTheme;
+  compact: boolean;
+}
+
+interface MeterStyles {
+  barTrack: ViewStyle;
+  ring: ViewStyle;
+  ringLeftClip: ViewStyle;
+  ringRightClip: ViewStyle;
+  ringLeftArc: ViewStyle;
+  ringRightArc: ViewStyle;
+  ringCenter: ViewStyle;
+  paceTick: ViewStyle;
+}
+
+function createStyles(
+  theme: PluginTheme,
+  tone: string,
+  sizes: { barHeight: number; ringSize: number; ringStroke: number; track: string },
+): MeterStyles {
+  const { barHeight, ringSize, ringStroke, track } = sizes;
+  const arc: ViewStyle = {
+    position: "absolute",
+    top: 0,
+    width: ringSize,
+    height: ringSize,
+    borderRadius: ringSize / 2,
+    borderWidth: ringStroke,
+    borderColor: track,
+    borderTopColor: tone,
+    borderRightColor: tone,
+  };
+  return {
+    barTrack: {
+      height: barHeight,
+      borderRadius: barHeight / 2,
+      backgroundColor: track,
+      overflow: "hidden",
+    },
+    ring: {
+      width: ringSize,
+      height: ringSize,
+      borderRadius: ringSize / 2,
+      backgroundColor: track,
+      alignItems: "center",
+      justifyContent: "center",
+      overflow: "hidden",
+    },
+    ringLeftClip: {
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: ringSize / 2,
+      height: ringSize,
+      overflow: "hidden",
+    },
+    ringRightClip: {
+      position: "absolute",
+      right: 0,
+      top: 0,
+      width: ringSize / 2,
+      height: ringSize,
+      overflow: "hidden",
+    },
+    ringLeftArc: { ...arc, left: 0 },
+    ringRightArc: { ...arc, right: 0 },
+    ringCenter: {
+      width: ringSize - ringStroke * 2,
+      height: ringSize - ringStroke * 2,
+      borderRadius: (ringSize - ringStroke * 2) / 2,
+      backgroundColor: theme.colors.surface1,
+    },
+    paceTick: {
+      position: "absolute",
+      top: 0,
+      left: ringSize / 2 - 1,
+      width: 2,
+      height: ringStroke + 1,
+      backgroundColor: theme.colors.foregroundMuted,
+    },
+  };
+}
+
+export function UsageMeter({
+  percentUsed,
+  percentFilled = percentUsed,
+  pacePercent,
+  style = "bar",
+  scale = "card",
+  trackColor,
+  theme,
+  compact,
+}: UsageMeterProps) {
+  const fillPercent = clampPercent(percentFilled);
+  const pace = pacePercent === null ? null : clampPercent(pacePercent);
+  const tone = usageTone(percentUsed, theme);
+  const rail = scale === "rail";
+  const barHeight = rail ? 4 : compact ? 4 : 6;
+  const ringSize = rail ? 14 : compact ? 42 : 50;
+  const ringStroke = rail ? 3 : compact ? 5 : 6;
+  const track = trackColor ?? theme.colors.surface2;
+  const styles = useMemo(
+    () => createStyles(theme, tone, { barHeight, ringSize, ringStroke, track }),
+    [theme, tone, barHeight, ringSize, ringStroke, track],
+  );
+  const barFill = useMemo<ViewStyle>(
+    () => ({
+      height: barHeight,
+      borderRadius: barHeight / 2,
+      backgroundColor: tone,
+      width: `${fillPercent}%`,
+    }),
+    [barHeight, fillPercent, tone],
+  );
+  const barPace = useMemo<ViewStyle | null>(() => {
+    if (pace === null) {
+      return null;
+    }
+    return {
+      position: "absolute",
+      top: 0,
+      bottom: 0,
+      width: 2,
+      marginLeft: -1,
+      left: `${pace}%`,
+      backgroundColor: theme.colors.foregroundMuted,
+    };
+  }, [pace, theme]);
+  const firstHalf = Math.min(fillPercent, 50) * 3.6;
+  const secondHalf = Math.max(fillPercent - 50, 0) * 3.6;
+  const leftArc = useMemo<ViewStyle>(
+    () => ({ transform: [{ rotate: `${secondHalf + 45}deg` }] }),
+    [secondHalf],
+  );
+  const rightArc = useMemo<ViewStyle>(
+    () => ({ transform: [{ rotate: `${firstHalf - 135}deg` }] }),
+    [firstHalf],
+  );
+  const ringPace = useMemo<ViewStyle | null>(() => {
+    if (pace === null) {
+      return null;
+    }
+    return {
+      position: "absolute",
+      width: ringSize,
+      height: ringSize,
+      transform: [{ rotate: `${pace * 3.6}deg` }],
+    };
+  }, [pace, ringSize]);
+
+  if (style === "ring") {
+    return (
+      <View
+        accessibilityLabel={`${percentFilled}% filled`}
+        accessibilityRole="progressbar"
+        style={styles.ring}
+      >
+        <View style={styles.ringRightClip}>
+          <View style={[styles.ringRightArc, rightArc]} />
+        </View>
+        <View style={styles.ringLeftClip}>
+          <View style={[styles.ringLeftArc, leftArc]} />
+        </View>
+        <View style={styles.ringCenter} />
+        {ringPace === null ? null : (
+          <View style={ringPace}>
+            <View style={styles.paceTick} />
+          </View>
+        )}
+      </View>
+    );
+  }
+
+  return (
+    <View
+      accessibilityLabel={`${percentFilled}% filled`}
+      accessibilityRole="progressbar"
+      style={styles.barTrack}
+    >
+      <View style={barFill} />
+      {barPace === null ? null : <View style={barPace} />}
+    </View>
+  );
+}

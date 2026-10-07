@@ -1,0 +1,282 @@
+# Usage Monitor (usage-monitor)
+
+A local Paseo plugin that answers two questions: _how much of my quota is left right now_, and _how many tokens have I burned over the last month_.
+
+> **Patched copy.** This repository is a patched copy of [ABorakati/paseo-usage-monitor](https://github.com/ABorakati/paseo-usage-monitor) by Aditya Borakati (MIT), at upstream commit `528fff9`. The plugin is upstream's work. The one local change is listed in [LOCAL-CHANGES.md](LOCAL-CHANGES.md): normal Codex refresh also records the expiry of every available banked reset credit (see the banked reset paragraphs below).
+
+## What it contributes
+
+Three sidebar surfaces.
+
+![Usage limits dashboard](docs/images/usage-limits.png)
+
+**Usage Monitor** — live provider state, one card per configured provider. Each card renders its readings as bars:
+
+- **quota** — used against a ceiling inside a resetting window (Claude's 5-hour and weekly buckets, per model family). The bar fills as you consume. Where a window has both a reset time and a duration, the bar also marks where even consumption would be, so you can see whether you are ahead of or behind pace.
+- **balance** — money or credits left, optionally against a starting total so a percentage means something.
+- **rate** — which pricing band is in force right now (peak vs off-peak) and when it changes.
+
+Colour follows the same thresholds as Paseo's own provider meters. A quota over 90% consumed is danger, at or above 70% is warning, below that is neutral. A balance is coloured off what _remains_, inverted: under 10% remaining is danger, under 30% is warning.
+
+A provider that fails to resolve or fails to fetch stays on screen as an error row. It never silently disappears.
+
+Cards are reordered by dragging the grip on the right of a card header, or with the `Move earlier` and `Move later` accessibility actions. Dragging an edge or the corner resizes one card: the right edge changes width, the bottom edge height, the corner both. How a card _renders_ is a provider setting rather than a control on the card itself - see [Card appearance](#card-appearance).
+
+A card can also carry a `notice`: one line saying why its readings are not current. A rate-limited provider keeps its last good readings with their original timestamp and explains itself in the notice rather than discarding real numbers — the surface shows it in the warning colour and marks the card stale. A provider whose credential was rejected does the same. A notice can accompany either a healthy-but-stale card or an error row, so it is independent of `status`. See [Rate limits](docs/PRESETS.md#rate-limits) and [Expiry](docs/CREDENTIALS.md#expiry).
+
+The Codex dashboard card and composer detail card show **Use banked reset** when the account has one available. The action checks the current credit, shows its expiry, and requires confirmation. See [`codex` caveats](docs/PRESETS.md#per-preset-caveats).
+
+Normal Codex refresh also reads banked reset credit details with a GET and records
+every available `codex_rate_limits` credit in the existing
+`$PASEO_HOME/usage-limits/last-readings.json` (default `~/.paseo`). The file remains
+`{ "version": 1, "providers": { "<provider-id>": { "fetchedAt": "<timestamp>", "readings": [] } } }`.
+The existing `banked-resets` balance reading is unchanged, including its count
+from the usage endpoint. New readings use the existing `rate` shape because it
+already holds nullable timestamps without a schema or file-version change:
+
+- `banked-reset-next-expiry`: `changesAt` is the soonest known expiry or null;
+  `state` is `Available` if any matching credits exist, otherwise `None`.
+- `banked-reset-1-expires`, `banked-reset-2-expires`, etc.: `state` is the backend
+  credit id, `changesAt` is its expiry timestamp or null, and `detail` is its
+  grant timestamp or null. Valid backend ISO timestamps are preserved; invalid
+  or missing dates become null. Credits are ordered by expiry, with nulls last
+  and backend order retained for ties. Numbers are positions, not stable ids.
+
+These readings have `group: "Banked reset expiries"` and `multiplier: null`.
+Consumers should identify readings by id and compare a non-null next expiry
+with the weekly quota's `window.resetsAt`. Check `fetchedAt` for freshness.
+No expiry readings means the detail GET failed or the cache predates this patch;
+it does not mean zero credits. Each successful refresh replaces the old list.
+This refresh never consumes a credit.
+
+![Usage history](docs/images/usage-history.png)
+
+**Usage history** — cumulative token usage over time as a stacked chart, switchable between 24h, 7d, and 30d. By default each series is one agent CLI. A provider row expands in place to show the models it ran, so the model breakdown appears beside everything else rather than replacing the view; several providers can be open at once. Grouping by model instead lifts every model to the top level, which is the only way to compare two models you reach through different tools.
+
+Series colour is derived from the active theme's accent rather than fixed, so it survives a theme change. Hue separates providers and lightness separates the models inside one provider, which keeps an expanded provider reading as a family instead of as new categories. Every colour is held above the WCAG non-text contrast floor of 3:1 against all three surface colours — see [Colour](docs/HISTORY.md#colour).
+
+It plots **Work** (input + output tokens) by default, with Cached, Total and Cost also selectable. Cache re-reads are 99.5% of the raw token total on real transcripts, so a single "tokens" figure reads as work performed when it mostly is not — see [Which metric, and why work is the default](docs/HISTORY.md#which-metric-and-why-work-is-the-default). Cost prices each turn from the vendor's own reported figure where a log carries one and from a cached public rate table otherwise, and says which — see [Cost](docs/HISTORY.md#cost).
+
+**Usage providers** — add, edit, test and remove providers from inside the app instead of hand-writing JSON. It writes the same config file, and a key you type goes into a separate owner-only secrets file rather than into the config. The same surface installs the Claude Code status line hook, which turns the `claude-statusline` preset into a turn-by-turn feed. See [Editing providers from the app](#editing-providers-from-the-app).
+
+## Install
+
+> **Requires Paseo v0.8.0 or newer.**
+
+Plugin code is trusted and unsandboxed. The server half runs in a subprocess with full access to the daemon machine — its files, processes, credentials, and network. Read a plugin before you install it.
+
+```bash
+
+# From GitHub (tracks main)
+paseo plugin add cleon-vm/paseo-usage-monitor-plugin
+```
+
+This reaches **running** in `paseo plugin ls` with no build step and no install scripts: the daemon compiles the plugin itself, and everything it imports is provided by Paseo. Git installs track `main`; `paseo plugin status` shows when the repository has moved and `paseo plugin update usage-monitor` pulls it. The npm package `npm:paseo-usage-monitor@<version>` and `paseo plugin add ABorakati/paseo-usage-monitor` install stock upstream, without the local change.
+
+Report bugs in upstream features on [upstream's GitHub issues](https://github.com/ABorakati/paseo-usage-monitor/issues).
+
+### Find it
+
+Once running, the plugin shows up in:
+
+- **Left sidebar** — two entries, **Usage Monitor** (gauge icon) and **Usage history** (chart icon). These open full-width surfaces.
+- **Settings → Plugins → Usage Monitor** — configure providers and limits directly from Paseo's settings.
+- **Composer slash command** — type `/usage` or `/usage history` in the composer to open the monitors without leaving your chat.
+- **Explorer side panel** — inside any workspace, the Explorer sidebar can host **Usage Monitor** and **Usage history**. Both panels default to the Explorer sidebar (`locations: ["explorer", "workspace"]`); add one with `Open Usage Monitor` from the command palette and the workspace remembers it.
+- **Composer rail** — per-provider usage pills pinned above the chat prompt input.
+- **Workspace tabs** — both panels can still be opened as full workspace tabs whenever you want via the command palette.
+- **Command palette** — `Open Usage Monitor` and `Open usage history` (open in Explorer), plus `Open Usage Monitor as workspace tab` and `Open usage history as workspace tab`.
+  The dashboard reads Claude Code, Codex, OpenCode, Oh My Pi, and Cursor out of the box with no configuration, discovering credentials already stored on device across JSON files and local SQLite databases. Adding anything else is done from the settings icon in the top right of the Usage Monitor surface; see [Editing providers from the app](#editing-providers-from-the-app).
+
+### Install from source (development)
+
+To work on the plugin itself, clone the checkout and register the directory instead, so the daemon runs your working tree:
+
+```bash
+git clone https://github.com/cleon-vm/paseo-usage-monitor-plugin.git
+cd paseo-usage-monitor-plugin
+npm install && npm run typecheck
+paseo plugin install .
+```
+
+`npm install` only fetches the type declarations used by `typecheck`; the daemon compiles the plugin itself and needs nothing from `node_modules`. If the plugin does not show as **running** within a few seconds, run `paseo daemon restart` and check again — the daemon occasionally needs one to pick up a newly added plugin entry.
+
+### After editing
+
+`paseo plugin reload usage-monitor` (or **Reload** in Settings > Plugins) picks up edits to the plugin's own TypeScript. It does **not** reload `usage-limits.json` — provider config is read per request, so a config edit takes effect on the next refresh.
+
+## Supported providers
+
+34 presets ship with the plugin, in five kinds. Which kind you get is the vendor's decision, not this plugin's: an ordinary API key that can read its own balance is the exception, and most frontier labs gate usage behind an admin credential or expose it only in per-request headers.
+
+| Kind             | What it reads                                                                          | Presets                                                                                                                                                                                                                            |
+| ---------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Subscription** | Consumption inside a resetting window, from the CLI's own login or a plan-specific key | `claude`, `claude-statusline`, `codex`, `cursor`, `grok`, `github-copilot`, `kimi`, `minimax`, `minimax-cn`, `zai-coding-plan` (alias `zai`), `zhipuai-coding-plan`, `synthetic`, `opencode-go`, `chutes`, `zenmux`, `antigravity` |
+| **Balance**      | Money or credits left on an ordinary API key                                           | `deepseek`, `moonshot`, `moonshot-cn`, `siliconflow`, `siliconflow-cn`, `stepfun-ai`, `stepfun`, `novita`, `deepinfra`, `venice`, `xai`, `nano-gpt`, `poe`                                                                         |
+| **Aggregator**   | Spend against a cap, per key or per account                                            | `openrouter`, `openrouter-credits`, `vercel`                                                                                                                                                                                       |
+| **Pricing band** | Which rate is in force now, from a schedule and no request                             | `deepseek-rate`                                                                                                                                                                                                                    |
+| **Template**     | A shape to repoint once the vendor ships an endpoint                                   | `opencode-zen`                                                                                                                                                                                                                     |
+
+Every endpoint, credential chain and caveat is in [Presets](docs/PRESETS.md), along with the list of vendors that cannot be read and why. Anything with a JSON endpoint, a CLI that prints JSON, or a file on disk can be added as a hand-written provider without a code change; see [Configuration](docs/CONFIGURATION.md) and [Recipes](docs/RECIPES.md).
+
+## Composer pills
+
+The rail directly above the chat composer displays compact usage pills for quick checks while prompting.
+
+![Composer pills](docs/images/composer-pills.png)
+
+A provider stays off the rail until it opts in. Turn a provider on in **Usage providers** under **Composer pill** using the **Show as pill above the composer** switch, or set `"display": { "pill": { "enabled": true } }` in `usage-limits.json`. Visibility is independently switchable for both surfaces in the editor via two toggle switches: **Show on dashboard** (controls the dashboard card, on by default) and **Show as pill above the composer** (controls the rail pill).
+
+Each pill tracks one reading from that provider:
+
+- **Three styles** — dial gauge (`ring`), left-to-right bar (`bar`), or the provider mark alone (`none`), drawn into the pill's small icon slot. An omitted style inherits the card meter shape.
+- **Used vs remaining** — counts consumed quota (`used`) or headroom left (`remaining`). An omitted direction inherits the card direction.
+- **Tracked reading** — automatic selection tracks the shortest resetting quota window (the five-hour session quota), falling back to a balance reading when no quota exists. A specific reading mapping can also be pinned.
+- **Text label** — off by default (the brand mark already identifies the pill), with choices for provider name or reading label when turned on.
+- **When it shows** — **Always show**, or **Match the agent**. Matching keeps the pill on the composers whose agent it belongs to: a Claude pill above Claude Code chats, a Codex pill above Codex ones, chosen by harness, model vendor, or model pattern. See [Matching the agent's harness and model](docs/CONFIGURATION.md#matching-the-agents-harness-and-model).
+- **Host-owned trigger** — the rail hands each pill a trigger the host renders and owns, and the pill always draws its icon with one line of text beside it, so nothing collapses away on a narrow pane.
+- **Host-anchored popover** — pressing a pill opens its detail card as a popover that the host anchors, positions, contains and dismisses, presented as a bottom sheet on compact layouts. A press outside the card closes it.
+- **Turn-ended auto-refresh** — on Paseo v0.8, the daemon lifecycle hook automatically triggers a background quota refresh when an agent turn ends, keeping readings current without waiting for the poll interval.
+- **Refresh via terminal** — when a card names the CLI that owns its stale credential, a **Refresh via terminal** action runs that CLI for you, live, right there in the card. See [Refresh via terminal](docs/CREDENTIALS.md#refresh-via-terminal) for what it does and does not do.
+
+Pressing a pill opens a per-provider detail card showing every quota window, its progress bar, and its reset time.
+
+![Composer pill detail panel](docs/images/composer-pill-card.webp)
+
+## Editing providers from the app
+
+The **Usage providers** sidebar surface adds, edits, tests and removes providers without opening an editor. It is a front end to the file documented in [Configuration](docs/CONFIGURATION.md), not a parallel system: it writes the same `${PASEO_HOME:-~/.paseo}/usage-limits.json`, in the same shape, and a config you wrote by hand shows up in it unchanged.
+
+### Card appearance
+
+Display settings about how a provider draws live in the same editor as the provider itself, because they are properties of that provider rather than of the session you happen to be in. They persist to `display` in `usage-limits.json` and survive a reload.
+
+| Setting           | Choices                                                                                     | Stored as                                              |
+| ----------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Icon & brand mark | Default, Lucide, Monogram, Image                                                            | `display.icon`, absent for the built-in mark           |
+| Show on dashboard | Switch (on/off)                                                                             | `display.dashboard`, absent when visible (default)     |
+| Meter             | Bar, Ring                                                                                   | `display.style`, absent for Bar                        |
+| Quota reads       | Used, Left                                                                                  | `display.value`, absent for Used                       |
+| Card order        | Integer                                                                                     | `display.order`, absent when unset                     |
+| Composer pill     | Switch (on/off), when it shows, matching rules, style, value, reading, text, readout, order | `display.pill`, absent when disabled with all defaults |
+| Readings per row  | not settable - measured                                                                     | nothing                                                |
+
+A default is stored as **absence**, not as a value: choosing Bar removes `display.style` rather than writing `"bar"`, because both renderers already read a missing key as the default. A config that stores every default would be longer without saying anything more.
+
+**Readings per row is not a preference.** The card measures itself and divides its own inner width by the narrowest a reading may become before it stops being readable, capped between one and four columns. Resizing a card therefore reflows it immediately, and a wider card shows more per row without anyone setting a number. The consequence worth knowing: two cards of different widths show different column counts, which is the point - the count describes the card, not the provider.
+
+A `columns` key written by an older version of this plugin parses and is dropped on the next write. Nothing reads it.
+
+### Where a typed key goes
+
+A key you type into the UI is **never written into `usage-limits.json`**. It goes into a sibling file:
+
+```
+${PASEO_HOME:-~/.paseo}/usage-limits.secrets.json
+```
+
+created with owner-only permissions (mode `0600`). The provider entry in the main config then references it as an ordinary `jsonFile` credential — exactly the mechanism a hand-written config uses. Nothing about the result is special-cased, which means you can read the config afterwards and understand it, and you can hand-edit a provider the surface created.
+
+The main config therefore stays safe to read aloud, paste into an issue, or commit. The secrets file is the one file to keep to yourself.
+
+When a preset already declares an environment-variable source, the surface keeps that source **first** in the chain and appends the stored-secret source after it. An env var you have exported still wins, so adding a key through the UI does not silently override the way you were already authenticating.
+
+### Stored secrets are write-only
+
+A stored secret is never sent back to the UI. The form shows it as `stored` with a replace action, so the value cannot be read back out through the surface it was typed into. Three behaviours cover everything:
+
+| You submit        | Result                        |
+| ----------------- | ----------------------------- |
+| The field omitted | Existing secret is preserved. |
+| A non-empty value | Existing secret is replaced.  |
+| An empty value    | Stored secret is deleted.     |
+
+### Test before you trust
+
+Each provider has a **Test** action. It builds a one-provider service and reads it once, bypassing the cache, reporting whether it succeeded, a message, and **how many readings came back**. On success the message also names the reading ids it resolved, so you can see which of your mappings actually produced something.
+
+That reading count is the part worth watching: a provider can succeed and still return nothing useful, which is what wrong JSON paths look like. A test that reports `ok` with zero readings means the request worked and the paths do not match.
+
+### RPCs
+
+The surface talks to four handlers, should you want to find them in the code or call them yourself:
+
+| RPC                            | Does                                                                                                  |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `usage.config.read`            | Returns the config, the two paths, preset summaries, and which credential names have a stored secret. |
+| `usage.config.write-provider`  | Writes one provider entry plus any secret values, and returns the new state.                          |
+| `usage.config.remove-provider` | Removes one provider by id and returns the new state.                                                 |
+| `usage.config.test-provider`   | Reads one provider once and returns `ok`, a message, and a reading count.                             |
+
+Every write returns the whole new state rather than an acknowledgement, so the surface can never drift from the file.
+
+## Usage-limit alerts
+
+When a turn fails because a provider's quota ran out — or a Claude Code turn ends with its "You've hit your limit" message — the plugin records a **usage-limit alert**. The chat shows it as a callout in place of the raw error, with the vendor's own wording, a link to the page where the quota is managed or topped up, and the reset time when the message named one. A toast fires at the same moment unless you turn it off.
+
+From the callout you can:
+
+- **Wait for the reset** — arm a resume. At the reset time the daemon sends the original agent a continue prompt, repeated with your last request.
+- **Top up** — buy credit when the refusal is a spent prepaid balance rather than an exhausted window. A balance has no reset to wait for, so a balance alert offers **Top up** and no resume.
+- **Hand off** — start a new agent on another provider, in the same working directory, with a prompt that repeats the last request.
+- **Dismiss** — close the callout without acting.
+
+The daemon reads the vendor from the agent's provider and, on a harness that runs many vendors, from the model id (`deepseek/deepseek-flash`, `moonshot/kimi-k3`, `openrouter/anthropic/claude-sonnet-4`). Every preset the plugin tracks is covered: Claude, Codex, GitHub Copilot, Cursor, Grok, Antigravity, Kimi, Z.ai, Zhipu, MiniMax, Synthetic, OpenCode Go, Chutes, ZenMux, DeepSeek, Moonshot, SiliconFlow, StepFun, Novita, DeepInfra, Venice, xAI, NanoGPT, Poe, OpenRouter, Vercel and OpenCode Zen, plus the Anthropic and OpenAI APIs behind an `anthropic/…` or `openai/…` model. A vendor whose console page is not published gets a callout with no link rather than a guessed one.
+
+### Alert settings
+
+The settings live in the alert file under `settings`:
+
+| Setting           | Default | Does                                                                 |
+| ----------------- | ------- | -------------------------------------------------------------------- |
+| `enabled`         | `true`  | Master switch for detection, callouts, and toasts.                   |
+| `autoResume`      | `false` | Arm a resume at the alert's reset time as soon as it is detected.    |
+| `handoffProvider` | `null`  | `provider/model` the handoff picker offers first.                    |
+| `autoHandoff`     | `false` | Create the handoff agent immediately instead of waiting for a click. |
+| `toast`           | `true`  | Show an in-app toast when an alert is detected.                      |
+
+### The alert file
+
+Alerts are stored in `${PASEO_HOME:-~/.paseo}/limit-alerts.json`, beside `usage-limits.json`. The file holds the settings and the most recent 50 alerts. Dismissed, resumed, and handed-off alerts are dropped once they are a week old, and a new limit for an agent replaces that agent's still-open alert.
+
+A resume is an in-process timer rather than a daemon schedule. Every scheduled resume is re-armed when the plugin starts, so it survives a reload. It does not survive a daemon that is down at the reset time: a resume that came due while the daemon was off fires on the next start.
+
+## Defaults
+
+With no `usage-limits.json` at all, the plugin reads the two local agent CLIs:
+
+```json
+{
+  "claude": { "preset": "claude" },
+  "codex": { "preset": "codex" }
+}
+```
+
+Both authenticate from files the CLIs already wrote, so this works with no setup on a machine where you have logged into Claude Code or Codex.
+
+To opt out, create the file. Defaults apply only when it is absent, so any file you write replaces them wholesale — a file listing only `my-gateway` yields only `my-gateway`. To keep an entry in the file but silenced, set `"enabled": false`.
+
+## Documentation
+
+| Guide                                      | Covers                                                                                                                     |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| [Configuration](docs/CONFIGURATION.md)     | `usage-limits.json`: the provider map, provider entries, preset merge rules, readings, sources, JSON paths                 |
+| [Credentials](docs/CREDENTIALS.md)         | Credential chains, expiry, and reading Claude quota without a token                                                        |
+| [Presets](docs/PRESETS.md)                 | The 34 presets, per-preset caveats, what is unverified, what is not supported, Antigravity, GitHub Copilot, rate limits    |
+| [Multiple accounts](docs/MULTI_ACCOUNT.md) | Two logins on one provider: arbitrary ids, the Provider id field, per-id secrets, a two-Codex recipe                       |
+| [Recipes](docs/RECIPES.md)                 | Complete `usage-limits.json` files: env keys, hand-written HTTP, a CLI command, a schedule-only rate, an `each` projection |
+| [Usage history](docs/HISTORY.md)           | Where the token history comes from, buckets, dedup, colour, metrics, cost, scan failures                                   |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Error rows, rate limits, expired credentials, null readings, command sources, history gaps                                 |
+
+## Acknowledgments
+
+Usage Monitor was inspired by the methods, reverse-engineering, and prior art in:
+
+- [CodexBar](https://github.com/steipete/CodexBar) by Peter Steinberger [MIT] -- menu-bar monitoring across AI coding providers, reverse-engineered provider quota endpoints, and OAuth session inspection.
+- [t3code](https://github.com/pingdotgg/t3code) [MIT] -- multi-harness agent control surfaces across Claude Code, Codex, Cursor, and OpenCode.
+- [tokscale](https://github.com/junhoyeo/tokscale) [MIT] -- multi-agent token tracking, cost visualization, and local transcript accounting.
+- [ccusage](https://github.com/ryoppippi/ccusage) [MIT] -- Claude Code token analysis from local transcript logs.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
