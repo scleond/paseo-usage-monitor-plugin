@@ -1490,6 +1490,10 @@ const PRESET_DEFINITIONS: Record<string, UsageProvider> = {
    * same windows. CodexBar's public-API fixture records `usage.rolling` with
    * `percent` and `resetsAt`; its parser also accepts `resetInSec`, so both reset
    * forms are declared and the projection keeps the absolute one authoritative.
+   * The vendor's `rolling` window is the five-hour short window every sibling
+   * preset names `session`/`Session`, so the reading carries that identity: a
+   * consumer selecting the short-window slot by the conventional id finds the
+   * live number instead of a missing row.
    */
   "opencode-go": definePreset({
     label: "OpenCode Go",
@@ -1508,12 +1512,12 @@ const PRESET_DEFINITIONS: Record<string, UsageProvider> = {
     readings: [
       {
         kind: "quota",
-        id: "rolling",
-        label: "Rolling",
+        id: "session",
+        label: "Session",
         unit: "percent",
         percentPath: "usage.rolling.percent",
         window: {
-          label: "5 hours",
+          label: "Session",
           resetsAtPath: "usage.rolling.resetsAt",
           resetsInSecPath: "usage.rolling.resetInSec",
           durationMs: FIVE_HOURS_MS,

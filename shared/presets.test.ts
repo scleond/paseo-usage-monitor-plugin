@@ -7,7 +7,7 @@ import {
   type UsageProvider,
 } from "./limits.shared";
 import { USAGE_PRESETS, getUsagePreset, listUsagePresetIds } from "./presets.shared";
-import { getDefaultPillMatchRules } from "./pills.shared";
+import { getDefaultPillMatchRules, selectPillReading } from "./pills.shared";
 import { projectReadings, requiresSourceDocument } from "../server/readings.server";
 import { buildProviderRegistry } from "../server/registry.server";
 
@@ -1148,11 +1148,11 @@ describe("verified presets resolve their recorded responses", () => {
   });
 
   test("opencode-go projects the public API's three percentage windows", () => {
-    expect(readingById("opencode-go", "rolling")).toMatchObject({
+    expect(readingById("opencode-go", "session")).toMatchObject({
       kind: "quota",
       unit: "percent",
       percent: 17,
-      window: { label: "5 hours", resetsAt: "2026-08-28T21:00:00.000Z", durationMs: 18_000_000 },
+      window: { label: "Session", resetsAt: "2026-08-28T21:00:00.000Z", durationMs: 18_000_000 },
     });
     expect(readingById("opencode-go", "weekly")).toMatchObject({
       percent: 75,
@@ -1162,6 +1162,22 @@ describe("verified presets resolve their recorded responses", () => {
       percent: 91,
       window: { label: "Monthly", resetsAt: "2026-09-28T16:00:00.000Z", durationMs: null },
     });
+  });
+
+  // The vendor publishes rolling/weekly/monthly only, so a consumer selecting
+  // the short-window slot by the conventional `session` id found nothing and
+  // rendered it missing while weekly beside it read 0%. The rolling five-hour
+  // window carries the session identity, like every sibling 5h preset, so the
+  // slot tracks live usage.
+  test("opencode-go exposes its rolling window under the session id", () => {
+    const readings = project("opencode-go");
+    const session = readings.find((reading) => reading.id === "session");
+    expect(session).toMatchObject({ kind: "quota", label: "Session", percent: 17 });
+    const pillPick = selectPillReading(
+      readings.filter((reading) => reading.kind === "quota" || reading.kind === "balance"),
+      null,
+    );
+    expect(pillPick?.id).toBe("session");
   });
 
   test("chutes projects request and credit windows from subscription usage", () => {
